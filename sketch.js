@@ -1,11 +1,12 @@
-function setup() {
-    createCanvas(400, 400);
-  }
-  
-  function draw() {
-    background(220);
-  }
-  let bg;
+/** Set false, or open with ?instrument=0, to hide the troubleshooting panel. */
+const INSTRUMENT =
+  typeof location !== 'undefined' && !/[?&]instrument=0(?:&|$)/.test(location.search);
+
+/** If true, each click (debounced) runs the same advance as a loud sound — isolates mic vs rendering. */
+const CLICK_SIMULATE_SOUND = true;
+
+let bg;
+let bgLoadState = 'loading';
   let circleSize = 100;
   let offsetX = 0;
   let offsetY = 0;
@@ -35,9 +36,51 @@ function setup() {
   
   let bgAlpha = 0;
   let fadeIn = false;
+
+  let micSetupNote = '';
+  let frameForLog = 0;
+
+  function instrumentInit() {
+    if (!INSTRUMENT) return;
+    const el = document.getElementById('debug-instrumentation');
+    if (el) el.hidden = false;
+
+    window.addEventListener('unhandledrejection', (e) => {
+      console.warn('[instrument] unhandledrejection', e.reason);
+    });
+    window.addEventListener('error', (e) => {
+      console.warn('[instrument] error', e.message, e.filename, e.lineno);
+    });
+  }
+
+  function instrumentLine(label, value) {
+    return label + ': ' + String(value);
+  }
+
+  function instrumentFlush(lines) {
+    if (!INSTRUMENT) return;
+    const el = document.getElementById('debug-instrumentation');
+    if (el) el.textContent = lines.join('\n');
+
+    frameForLog++;
+    if (frameForLog % 45 === 0) {
+      console.log('[instrument]', Object.fromEntries(lines.map((L) => {
+        const i = L.indexOf(':');
+        return i === -1 ? [L, ''] : [L.slice(0, i), L.slice(i + 2)];
+      })));
+    }
+  }
   
   function preload() {
-    bg = loadImage('assets/bg.png');
+    instrumentInit();
+    bg = loadImage(
+      'assets/bg.png',
+      () => { bgLoadState = 'loaded'; },
+      (evt) => {
+        bgLoadState = 'load failed (check path & server)';
+        console.warn('[instrument] bg image error', evt);
+      }
+    );
   }
   
   function setup() {
@@ -46,8 +89,42 @@ function setup() {
     offsetY = -height * 0.1;
     noStroke();
   
-    mic = new p5.AudioIn();
-    mic.start();
+    try {
+      mic = new p5.AudioIn();
+      // Do not mic.start() here: AudioContext stays "suspended" until a user gesture,
+      // so getLevel() stays 0 until the user clicks/taps (see userEnabledAudioInput).
+      micSetupNote = 'Click or tap the canvas to enable mic (browser audio policy)';
+    } catch (e) {
+      micSetupNote = 'mic error: ' + e.message;
+      console.warn('[instrument]', micSetupNote, e);
+    }
+  }
+
+  function userEnabledAudioInput() {
+    if (typeof userStartAudio === 'function') {
+      userStartAudio();
+    }
+    try {
+      const ac = typeof getAudioContext === 'function' ? getAudioContext() : null;
+      if (ac && ac.state === 'suspended') {
+        ac.resume().then(() => {
+          micSetupNote = 'audio context: running — try speaking';
+        }).catch((e) => {
+          micSetupNote = 'resume failed: ' + e.message;
+        });
+      }
+      if (ac) {
+        micSetupNote = 'audio context: ' + ac.state + ' (allow mic if prompted)';
+      }
+    } catch (e) {
+      micSetupNote = 'audio unlock: ' + e.message;
+    }
+    if (!mic) return;
+    try {
+      mic.start();
+    } catch (e) {
+      micSetupNote = 'mic.start: ' + e.message;
+    }
   }
   
   function createLeaf() {
@@ -160,6 +237,26 @@ function setup() {
       available.splice(index, 1);
     }
   }
+
+  function tryAdvanceFromSound() {
+    if (millis() - lastSoundTime <= debounceDelay) return;
+
+    if (state === 0) {
+      state = 1;
+      fadeIn = false;
+    } else if (state === 1) {
+      state = 2;
+      leaves = [];
+      fruits = [];
+      subState = 1;
+    } else if (state === 2 && leaves.length >= leafCount && fruits.length >= fruitCount) {
+      state = 3;
+    } else if (state === 3) {
+      triggerFruitDrop();
+    }
+
+    lastSoundTime = millis();
+  }
   
   function draw() {
   
@@ -179,28 +276,19 @@ function setup() {
       noTint();
     }
   
-    soundLevel = mic.getLevel();
-  
-    if (soundLevel > soundThreshold && millis() - lastSoundTime > debounceDelay) {
-  
-      if (state === 0) {
-        state = 1;
-        fadeIn = false;
-  
-      } else if (state === 1) {
-        state = 2;
-        leaves = [];
-        fruits = [];
-        subState = 1;
-  
-      } else if (state === 2 && leaves.length >= leafCount && fruits.length >= fruitCount) {
-        state = 3;
-  
-      } else if (state === 3) {
-        triggerFruitDrop();
+    if (mic) {
+      try {
+        soundLevel = mic.getLevel();
+      } catch (e) {
+        soundLevel = 0;
+        micSetupNote = 'getLevel error: ' + e.message;
       }
+    } else {
+      soundLevel = 0;
+    }
   
-      lastSoundTime = millis();
+    if (soundLevel > soundThreshold) {
+      tryAdvanceFromSound();
     }
   
     if (state === 2) {
@@ -223,14 +311,62 @@ function setup() {
     if (state !== 0) {
       updateAndDisplayElements();
     }
+
+    if (INSTRUMENT) {
+      let acState = 'n/a';
+      try {
+        if (typeof getAudioContext === 'function') {
+          const ac = getAudioContext();
+          if (ac) acState = ac.state;
+        }
+      } catch (e) {
+        acState = 'err';
+      }
+
+      const gUM = typeof navigator !== 'undefined' && navigator.mediaDevices && navigator.mediaDevices.getUserMedia
+        ? 'available'
+        : 'missing (no mic API)';
+
+      instrumentFlush([
+        instrumentLine('page', location.href.split('?')[0]),
+        instrumentLine('secure context', window.isSecureContext),
+        instrumentLine('protocol', location.protocol),
+        instrumentLine('getUserMedia', gUM),
+        instrumentLine('audio context', acState),
+        instrumentLine('mic note', micSetupNote),
+        instrumentLine('bg image', bgLoadState),
+        instrumentLine('state', state),
+        instrumentLine('soundLevel', soundLevel !== undefined ? nf(soundLevel, 1, 5) : 'n/a'),
+        instrumentLine('threshold', soundThreshold),
+        instrumentLine('click sim', CLICK_SIMULATE_SOUND ? 'on (click to advance)' : 'off'),
+        instrumentLine(
+          'hint',
+          CLICK_SIMULATE_SOUND
+            ? 'Click advances like sound; compare to mic soundLevel'
+            : 'White screen = state 0; loud noise should set state 1 if mic works'
+        ),
+      ]);
+    }
   }
   
   function keyPressed() {
     if (key === 'f' || key === 'F') fullscreen(true);
   }
   
+  function onCanvasPointerDown() {
+    userEnabledAudioInput();
+    if (CLICK_SIMULATE_SOUND) {
+      tryAdvanceFromSound();
+    }
+  }
+
   function mousePressed() {
-    mic.start();
+    onCanvasPointerDown();
+  }
+
+  function touchStarted() {
+    onCanvasPointerDown();
+    return false;
   }
   
   function windowResized() {
