@@ -1,12 +1,11 @@
-/** Troubleshooting panel — hide with ?instrument=0 */
-const INSTRUMENT =
-  typeof location !== 'undefined' && !/[?&]instrument=0(?:&|$)/.test(location.search);
+/** Debug pane hidden by default; press D to toggle. */
+let debugPaneVisible = false;
 
 /** Click to simulate sound input for testing */
 const CLICK_SIMULATE_SOUND = true;
 
 /** Match current git tag (`git describe --tags`). */
-const SKETCH_VERSION = 'v0.2.0';
+const SKETCH_VERSION = 'v0.2.1';
 
 // ── Tree structure ────────────────────────────────────────
 const MAX_DEPTH       = 8;
@@ -49,32 +48,36 @@ let mic;
 let soundLevel = 0;
 /** Rolling ~30s ambient; `soundThreshold` is derived each frame from recent samples. */
 const AMBIENT_WINDOW_MS = 30000;
-const THRESHOLD_FLOOR   = 0.016;
-const THRESHOLD_ABOVE_MEAN = 0.024;
-const THRESHOLD_STD_COEF = 1.35;
+/** Raised so normal conversation stays below; loud claps still spike above. */
+const THRESHOLD_FLOOR   = 0.03;
+const THRESHOLD_ABOVE_MEAN = 0.058;
+const THRESHOLD_STD_COEF = 2.1;
 let soundSampleRing = [];
 let soundThreshold = THRESHOLD_FLOOR;
 let ambientMeanLevel = 0;
 let ambientStdLevel  = 0;
 let lastSoundTime  = 0;
-let debounceDelay  = 300;
+let debounceDelay  = 480;
 /** `millis()` when level first went at/below threshold; `null` while loud enough to grow. */
 let quietSinceMs = null;
 
 // ── Instrumentation ───────────────────────────────────────
 let micSetupNote = '';
 let frameForLog  = 0;
+let instrumentListenersAttached = false;
 
 function instrumentInit() {
-  if (!INSTRUMENT) return;
   const el = document.getElementById('debug-instrumentation');
-  if (el) el.hidden = false;
-  window.addEventListener('unhandledrejection', (e) => {
-    console.warn('[instrument] unhandledrejection', e.reason);
-  });
-  window.addEventListener('error', (e) => {
-    console.warn('[instrument] error', e.message, e.filename, e.lineno);
-  });
+  if (el) el.hidden = !debugPaneVisible;
+  if (!instrumentListenersAttached) {
+    instrumentListenersAttached = true;
+    window.addEventListener('unhandledrejection', (e) => {
+      console.warn('[instrument] unhandledrejection', e.reason);
+    });
+    window.addEventListener('error', (e) => {
+      console.warn('[instrument] error', e.message, e.filename, e.lineno);
+    });
+  }
 }
 
 function instrumentLine(label, value) {
@@ -82,7 +85,7 @@ function instrumentLine(label, value) {
 }
 
 function instrumentFlush(lines) {
-  if (!INSTRUMENT) return;
+  if (!debugPaneVisible) return;
   const el = document.getElementById('debug-instrumentation');
   if (el) el.textContent = lines.join('\n');
   frameForLog++;
@@ -454,7 +457,7 @@ function draw() {
     }
   }
 
-  if (INSTRUMENT) {
+  if (debugPaneVisible) {
     let acState = 'n/a';
     try {
       if (typeof getAudioContext === 'function') {
@@ -512,6 +515,11 @@ function draw() {
 
 function keyPressed() {
   if (key === 'f' || key === 'F') fullscreen(true);
+  else if (key === 'd' || key === 'D') {
+    debugPaneVisible = !debugPaneVisible;
+    const el = document.getElementById('debug-instrumentation');
+    if (el) el.hidden = !debugPaneVisible;
+  }
 }
 
 function onCanvasPointerDown() {

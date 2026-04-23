@@ -1,5 +1,5 @@
 /** Keep in sync with the current git tag for this demo (see `git describe --tags`). */
-const SKETCH_VERSION = 'v0.2.0';
+const SKETCH_VERSION = 'v0.2.1';
 
 let maxLevels = 12;
 
