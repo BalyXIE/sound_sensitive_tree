@@ -1,0 +1,32 @@
+html, body {
+    margin: 0;
+    padding: 0;
+  }
+  canvas {
+    display: block;
+  }
+
+  .debug-panel {
+    position: fixed;
+    left: 8px;
+    bottom: 8px;
+    max-width: min(420px, 92vw);
+    max-height: 40vh;
+    overflow: auto;
+    margin: 0;
+    padding: 8px 10px;
+    font: 12px/1.35 ui-monospace, monospace;
+    color: #0d0;
+    background: rgba(0, 0, 0, 0.82);
+    border: 1px solid #333;
+    border-radius: 6px;
+    z-index: 99999;
+    pointer-events: none;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  .debug-panel[hidden] {
+    display: none !important;
+  }
+  
