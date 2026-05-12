@@ -25,6 +25,11 @@ const WIND_STRENGTH = 0.045;
 // ── State machine ─────────────────────────────────────────
 // 0: waiting for first interaction   1: alive (tree persists, grows with sound)
 let state = 0;
+/** Eco intro until first clap (or click-sim) advances into the tree. */
+let introActive = true;
+/** Debounced claps counted on intro screen; need INTRO_CLAPS_NEEDED to start the tree. */
+const INTRO_CLAPS_NEEDED = 3;
+let introClapCount = 0;
 
 // ── Growth tuning ─────────────────────────────────────────
 const GROWTH_PER_EVENT = 0.03;   // one “step” of growth
@@ -340,6 +345,57 @@ function drawTerrain(horizon, t) {
   bezierVertex(W * 0.88, horizon + 78, W * 0.98, horizon + 90, W + 140, horizon + 84);
   vertex(W + 140, H + 80);
   endShape(CLOSE);
+}
+
+/** Environmental welcome: English headline + blinking subtitle; ends after INTRO_CLAPS_NEEDED claps. */
+function drawIntroOverlay() {
+  push();
+  noStroke();
+  fill(132, 38, 12, 0.38);
+  rect(0, 0, width, height);
+  fill(118, 55, 22, 0.28);
+  rect(0, height * 0.5, width, height * 0.5);
+
+  const cx = width * 0.5;
+  const cy = height * 0.5;
+  // With (w, h) bounds, p5 uses (x, y) as the **top-left** of the box — not the center — so center with (width - w) / 2.
+  textAlign(CENTER, TOP);
+  const title = 'Want the environment to keep getting better?';
+  const subtitle = 'It starts with a clap.';
+  const titleSize = constrain(width * 0.036, 20, 42);
+  const subSize = constrain(width * 0.022, 12, 22);
+  const blink = 0.38 + 0.58 * (0.5 + 0.5 * sin(millis() * 0.0075));
+
+  const titleW = min(width * 0.88, 720);
+  const titleX = (width - titleW) * 0.5;
+  const titleBoxH = min(height * 0.26, titleSize * 5.5);
+  const titleY = cy - height * 0.2;
+
+  textStyle(BOLD);
+  textSize(titleSize);
+  textLeading(titleSize * 1.28);
+  fill(138, 18, 99, 0.96);
+  text(title, titleX, titleY, titleW, titleBoxH);
+
+  const subW = min(width * 0.9, 680);
+  const subX = (width - subW) * 0.5;
+  const subY = titleY + titleBoxH + height * 0.03;
+
+  textStyle(NORMAL);
+  textSize(subSize);
+  textLeading(subSize * 1.35);
+  fill(125, 28, 98, blink);
+  text(subtitle, subX, subY, subW, height * 0.12);
+
+  const progW = min(width * 0.55, 420);
+  const progX = (width - progW) * 0.5;
+  const progY = subY + height * 0.12 + height * 0.02;
+
+  textSize(constrain(width * 0.02, 12, 18));
+  fill(132, 20, 88, 0.75);
+  text(introClapCount + ' / ' + INTRO_CLAPS_NEEDED + ' claps', progX, progY, progW, height * 0.08);
+
+  pop();
 }
 
 function drawBeijingDayNightBackground() {
@@ -864,9 +920,20 @@ function updateAndDisplayElements() {
 function tryAdvanceFromSound() {
   if (millis() - lastSoundTime <= debounceDelay) return;
 
-  if (state === 0) {
+  if (state === 0 && introActive) {
+    introClapCount++;
+    lastSoundTime = millis();
+    if (introClapCount < INTRO_CLAPS_NEEDED) {
+      reactIntensity = min(1, reactIntensity + 0.42);
+      return;
+    }
     state = 1;
     treeSeed = floor(millis());
+    introActive = false;
+  } else if (state === 0) {
+    state = 1;
+    treeSeed = floor(millis());
+    introActive = false;
   }
 
   if (state === 1) {
@@ -895,6 +962,9 @@ function tryAdvanceFromSound() {
 
 function draw() {
   drawBeijingDayNightBackground();
+
+  const micHint = document.getElementById('mic-hint');
+  if (micHint) micHint.style.opacity = introActive ? '0' : '';
 
   // If mic permission was already granted for this origin, this sometimes succeeds without a click.
   if (mic && !micStreamStarted && autoMicAttempts < 90) {
@@ -946,6 +1016,10 @@ function draw() {
     }
   }
 
+  if (introActive) {
+    drawIntroOverlay();
+  }
+
   if (debugPaneVisible) {
     let acState = 'n/a';
     try {
@@ -972,7 +1046,7 @@ function draw() {
       instrumentLine('secure context', window.isSecureContext),
       instrumentLine('audio context', acState),
       instrumentLine('mic note', micSetupNote),
-      instrumentLine('state', state),
+      instrumentLine('state', state + (introActive ? ' intro ' + introClapCount + '/' + INTRO_CLAPS_NEEDED : '')),
       instrumentLine('treeGrowth', nf(treeGrowth, 1, 3)),
       instrumentLine('soundLevel', nf(soundLevel, 1, 5)),
       instrumentLine(
