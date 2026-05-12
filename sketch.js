@@ -30,6 +30,36 @@ let introActive = true;
 /** Debounced claps counted on intro screen; need INTRO_CLAPS_NEEDED to start the tree. */
 const INTRO_CLAPS_NEEDED = 3;
 let introClapCount = 0;
+/** Debounced claps while the tree is active; at TREE_CLAPS_FOR_THANKS show a thank-you banner. */
+const TREE_CLAPS_FOR_THANKS = 30;
+let treeClapCount = 0;
+const THANKS_BANNER_MS = 16000;
+let thanksBannerStartMs = 0;
+let thanksBannerUntilMs = 0;
+/** No pointer / key / debounced clap for this long → back to intro. */
+const IDLE_RESET_MS = 45000;
+let lastUserActivityMs = 0;
+
+function bumpUserActivity() {
+  lastUserActivityMs = millis();
+}
+
+function resetToInitialExperience() {
+  state = 0;
+  introActive = true;
+  introClapCount = 0;
+  treeGrowth = 0;
+  fruits = [];
+  fruitPluckBudget = 0;
+  fruitDropSoundPulseCounter = 0;
+  treeClapCount = 0;
+  thanksBannerUntilMs = 0;
+  thanksBannerStartMs = 0;
+  reactIntensity = 0;
+  quietSinceMs = null;
+  lastSoundTime = millis();
+  bumpUserActivity();
+}
 
 // ── Growth tuning ─────────────────────────────────────────
 const GROWTH_PER_EVENT = 0.03;   // one “step” of growth
@@ -119,7 +149,10 @@ function instrumentInit() {
 function attachGlobalAudioUnlockOnce() {
   if (globalAudioUnlockAttached || typeof window === 'undefined') return;
   globalAudioUnlockAttached = true;
-  const unlock = () => { userEnabledAudioInput(); };
+  const unlock = () => {
+    bumpUserActivity();
+    userEnabledAudioInput();
+  };
   window.addEventListener('pointerdown', unlock, { capture: true, passive: true });
   window.addEventListener('keydown', unlock, { capture: true, passive: true });
   window.addEventListener('touchend', unlock, { capture: true, passive: true });
@@ -161,6 +194,7 @@ function setup() {
     micSetupNote = 'mic error: ' + e.message;
     console.warn('[instrument]', micSetupNote, e);
   }
+  bumpUserActivity();
 }
 
 function smoothstep(edge0, edge1, x) {
@@ -395,6 +429,34 @@ function drawIntroOverlay() {
   fill(132, 20, 88, 0.75);
   text(introClapCount + ' / ' + INTRO_CLAPS_NEEDED + ' claps', progX, progY, progW, height * 0.08);
 
+  pop();
+}
+
+/** After TREE_CLAPS_FOR_THANKS play claps, brief centered thank-you (English). */
+function drawThanksBanner() {
+  if (thanksBannerUntilMs <= 0 || millis() >= thanksBannerUntilMs) return;
+  const fadeOut = thanksBannerUntilMs - millis() < 2800
+    ? constrain((thanksBannerUntilMs - millis()) / 2800, 0, 1)
+    : 1;
+  const fadeIn = min(1, (millis() - thanksBannerStartMs) / 500);
+  const a = constrain(fadeIn, 0, 1) * fadeOut;
+
+  push();
+  noStroke();
+  fill(128, 40, 14, 0.42 * a);
+  rect(0, 0, width, height);
+
+  textAlign(CENTER, TOP);
+  textStyle(NORMAL);
+  const msg =
+    'Thank you for this small step toward protecting the environment.';
+  const tw = min(width * 0.88, 680);
+  const tx = (width - tw) * 0.5;
+  const ty = height * 0.4;
+  textSize(constrain(width * 0.032, 18, 36));
+  textLeading(textSize() * 1.35);
+  fill(138, 16, 99, 0.96 * a);
+  text(msg, tx, ty, tw, height * 0.35);
   pop();
 }
 
@@ -919,6 +981,9 @@ function updateAndDisplayElements() {
 
 function tryAdvanceFromSound() {
   if (millis() - lastSoundTime <= debounceDelay) return;
+  bumpUserActivity();
+
+  const recordTreePlayClap = state === 1 && !introActive;
 
   if (state === 0 && introActive) {
     introClapCount++;
@@ -953,6 +1018,14 @@ function tryAdvanceFromSound() {
         }
       }
     }
+
+    if (recordTreePlayClap) {
+      treeClapCount++;
+      if (treeClapCount === TREE_CLAPS_FOR_THANKS) {
+        thanksBannerStartMs = millis();
+        thanksBannerUntilMs = thanksBannerStartMs + THANKS_BANNER_MS;
+      }
+    }
   }
 
   lastSoundTime = millis();
@@ -962,6 +1035,10 @@ function tryAdvanceFromSound() {
 
 function draw() {
   drawBeijingDayNightBackground();
+
+  if (millis() - lastUserActivityMs >= IDLE_RESET_MS) {
+    resetToInitialExperience();
+  }
 
   const micHint = document.getElementById('mic-hint');
   if (micHint) micHint.style.opacity = introActive ? '0' : '';
@@ -1020,6 +1097,8 @@ function draw() {
     drawIntroOverlay();
   }
 
+  drawThanksBanner();
+
   if (debugPaneVisible) {
     let acState = 'n/a';
     try {
@@ -1048,6 +1127,11 @@ function draw() {
       instrumentLine('mic note', micSetupNote),
       instrumentLine('state', state + (introActive ? ' intro ' + introClapCount + '/' + INTRO_CLAPS_NEEDED : '')),
       instrumentLine('treeGrowth', nf(treeGrowth, 1, 3)),
+      instrumentLine('tree claps', treeClapCount + (thanksBannerUntilMs > millis() ? ' (thanks)' : '')),
+      instrumentLine(
+        'idle reset in',
+        nf(max(0, (IDLE_RESET_MS - (millis() - lastUserActivityMs)) / 1000), 1, 1) + 's'
+      ),
       instrumentLine('soundLevel', nf(soundLevel, 1, 5)),
       instrumentLine(
         'ambient ~30s',
@@ -1086,6 +1170,7 @@ function draw() {
 // ── Event handlers ────────────────────────────────────────
 
 function keyPressed() {
+  bumpUserActivity();
   if (key === 'f' || key === 'F') fullscreen(true);
   else if (key === 'd' || key === 'D') {
     debugPaneVisible = !debugPaneVisible;
@@ -1095,6 +1180,7 @@ function keyPressed() {
 }
 
 function onCanvasPointerDown() {
+  bumpUserActivity();
   userEnabledAudioInput();
   if (CLICK_SIMULATE_SOUND) tryAdvanceFromSound();
 }
