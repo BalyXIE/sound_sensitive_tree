@@ -9,6 +9,9 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PARENT = path.resolve(__dirname, '..');
+/** Sketch lives in this folder; postcard PDF/HTML live next to it (parent). */
+const SEARCH_ROOTS = [__dirname, PARENT];
 const PORT = Number(process.env.PORT) || 8765;
 
 const MIME = {
@@ -23,13 +26,39 @@ const MIME = {
   '.jpg': 'image/jpeg',
   '.jpeg': 'image/jpeg',
   '.webp': 'image/webp',
+  '.pdf': 'application/pdf',
 };
 
-function safePath(rel) {
-  const base = path.resolve(__dirname);
+function safePathIn(baseDir, rel) {
+  const base = path.resolve(baseDir);
   const resolved = path.resolve(base, rel);
   if (!resolved.startsWith(base)) return null;
   return resolved;
+}
+
+function collectCandidates(rel) {
+  const out = [];
+  for (const root of SEARCH_ROOTS) {
+    const p = safePathIn(root, rel);
+    if (p && !out.includes(p)) out.push(p);
+  }
+  return out;
+}
+
+function statFirstFile(candidates, cb) {
+  let i = 0;
+  const next = () => {
+    if (i >= candidates.length) {
+      cb(new Error('ENOENT'), null);
+      return;
+    }
+    const filePath = candidates[i++];
+    fs.stat(filePath, (err, st) => {
+      if (err || !st.isFile()) return next();
+      cb(null, filePath);
+    });
+  };
+  next();
 }
 
 const server = http.createServer((req, res) => {
@@ -37,15 +66,15 @@ const server = http.createServer((req, res) => {
   if (rel === '/' || rel === '') rel = 'index.html';
   else rel = rel.replace(/^\/+/, '');
 
-  const filePath = safePath(rel);
-  if (!filePath) {
+  const candidates = collectCandidates(rel);
+  if (!candidates.length) {
     res.writeHead(403);
     res.end('Forbidden');
     return;
   }
 
-  fs.stat(filePath, (err, st) => {
-    if (err || !st.isFile()) {
+  statFirstFile(candidates, (err, filePath) => {
+    if (err || !filePath) {
       res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
       res.end('Not found');
       return;
@@ -57,6 +86,9 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, '127.0.0.1', () => {
-  console.log(`Sound tree: http://127.0.0.1:${PORT}/`);
+  const host = `http://127.0.0.1:${PORT}`;
+  console.log(`Sound tree: ${host}/`);
+  console.log(`Postcard: ${host}/postcard/postcard.html`);
+  console.log(`Business cards (PDF): ${host}/postcard/business-cards.pdf`);
   console.log('Click the page once to allow microphone, then clap. Press Ctrl+C to stop.');
 });

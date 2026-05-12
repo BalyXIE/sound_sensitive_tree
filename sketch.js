@@ -34,8 +34,12 @@ const GROWTH_STEPS_PER_SOUND = 2;
 const FRUIT_THRESHOLD   = 1.0;
 /** After this many ms below the adaptive threshold, `treeGrowth` begins to decrease. */
 const SILENCE_BEFORE_SHRINK_MS = 1800;
-/** Per-frame reduction of `treeGrowth` while sustained quiet (~0.0004 → full→0 in ~40–50 s at 60 fps). */
-const SHRINK_PER_FRAME = 0.00038;
+/** Target duration (seconds) for `treeGrowth` 1→0 while sustained quiet; assumes ~60 fps. */
+const SHRINK_TARGET_SECONDS = 10;
+const SHRINK_PER_FRAME = 1 / (SHRINK_TARGET_SECONDS * 60);
+/** Once shrink starts, canopy berries fade out in this many seconds (faster than the trunk). */
+const FRUIT_FIRST_SHRINK_FADE_SECONDS = 0.6;
+const FRUIT_QUIET_FADE_PER_FRAME = 1 / (FRUIT_FIRST_SHRINK_FADE_SECONDS * 60);
 
 // ── Reaction (visual feedback on sound) ───────────────────
 let reactIntensity = 0;           // 0→1, spikes on sound event, decays per frame
@@ -46,14 +50,17 @@ let fruits = [];
 /** Terminal twigs are grouped by this size; one fruit picks a random twig inside each group. */
 const FRUIT_TWIG_PAIR = 2;
 /** Target ≈ this fraction of all twig tips with a berry (can exceed 1 pair → both twigs get berries over slots). */
-const FRUIT_CANOPY_DENSITY = 0.72;
-const FRUIT_MAX = 420;
+const FRUIT_CANOPY_DENSITY = 0.576;
+const FRUIT_MAX = 336;
 /** Avoid stutter when the canopy first fills. */
 const FRUIT_SPAWN_PER_FRAME = 16;
 /** Max queued “drops” from claps; consumed slowly so berries fall a few at a time. */
 const FRUIT_PLUCK_BUDGET_CAP = 28;
 
 let fruitPluckBudget = 0;
+/** After canopy has living berries, every Nth debounced sound forces one drop (no ripen wait). */
+const FRUIT_DROP_FORCE_EVERY_N_SOUNDS = 3;
+let fruitDropSoundPulseCounter = 0;
 
 // ── Background (Beijing time → sun / moon / sky / terrain) ─
 
@@ -220,16 +227,26 @@ function drawAtmosphericSky(horizon, t) {
 function drawHighClouds(horizon, t, night) {
   const dayVis = 1 - night * 0.92;
   noStroke();
-  const seed = width * 0.0017 + height * 0.0009;
-  for (let k = 0; k < 48; k++) {
-    const u = k / 47;
-    const cx = width * fract(0.13 + u * 1.71 + sin(k * 2.17 + seed) * 0.08);
-    const cy = horizon * (0.08 + noise(k * 0.31, seed) * 0.42);
-    const w = width * (0.08 + noise(k * 0.5) * 0.1);
-    const h = w * (0.35 + noise(k * 0.2, 2) * 0.2);
-    const a = (0.018 + noise(k * 0.15) * 0.035) * dayVis;
-    fill(210, 4 + night * 8, 100, a);
-    ellipse(cx, cy, w, h);
+  const sh = width * 0.00217 + height * 0.00131 + 418.3;
+  const nClouds = 25;
+  const fc = frameCount;
+
+  for (let k = 0; k < nClouds; k++) {
+    const slot = fract(0.06 + k * 0.6180339887 + sh * 0.00013);
+    const v =
+      (0.000012 + fract(sin((k + 1) * 127.1 + sh) * 12345.6) * 0.00002) *
+      (k % 2 === 0 ? 1 : -1);
+    const cx = width * fract(slot + fc * v);
+    const cy =
+      horizon *
+      (0.06 + fract(k * 0.271 + sh * 0.02) * 0.32 + noise(k * 2.1 + 1, sh * 0.11) * 0.1);
+    const baseR = width * (0.05 + noise(k * 1.7 + 2, sh * 0.07) * 0.048);
+    // Single cloud = one largest ellipse only (no small orbiting circles)
+    const ellW = baseR * 1.28;
+    const ellH = baseR * 0.7;
+    const coreA = (0.17 + noise(k * 0.35, sh) * 0.07) * dayVis;
+    fill(210, 5 + night * 8, 100, coreA);
+    ellipse(cx, cy, ellW, ellH);
   }
 }
 
@@ -282,6 +299,10 @@ function drawTerrain(horizon, t) {
   const night = nightAmountFromHour(t);
   noStroke();
 
+  // Solid slab under hills so curved layers never leave a sliver (e.g. bottom-right) uncovered.
+  fill(lerp(88, 96, night * 0.25), lerp(22, 16, night), lerp(48, 22, night));
+  rect(-4, horizon - 2, W + 8, H - horizon + 140);
+
   fill(lerp(168, 152, night * 0.5), lerp(18, 32, night), lerp(22, 14, night));
   beginShape();
   vertex(-120, H + 60);
@@ -313,10 +334,11 @@ function drawTerrain(horizon, t) {
   const gl = (1 - night) * 0.22;
   fill(78, 18, 88, gl);
   beginShape();
-  vertex(W * 0.02, H + 80);
-  vertex(0, horizon + 88);
+  vertex(-40, H + 80);
+  vertex(-40, horizon + 88);
   bezierVertex(W * 0.24, horizon + 76, W * 0.5, horizon + 96, W * 0.78, horizon + 82);
-  vertex(W, H + 80);
+  bezierVertex(W * 0.88, horizon + 78, W * 0.98, horizon + 90, W + 140, horizon + 84);
+  vertex(W + 140, H + 80);
   endShape(CLOSE);
 }
 
@@ -522,12 +544,31 @@ function drawTree() {
   randomSeed(millis());
 }
 
+/**
+ * Sway for berries while they fade: `followTip` uses live `twigTips` when present (canopy fade);
+ * otherwise matches canopy wind in `drawBranch` around anchor `f.px` / `f.py`.
+ */
+function fruitSwayDrawPosition(f, followTip) {
+  if (followTip && twigTips.length > 0) {
+    const t = twigTips[f.tipIndex % twigTips.length];
+    return { x: t.x, y: t.y };
+  }
+  const wPhase = frameCount * WIND_SPEED;
+  const k = (f.tipIndex + 1) * 0.391 + (treeSeed & 4095) * 0.0003;
+  const gWind = sin(wPhase + k) * 0.55 + sin(wPhase * 2.1 + k * 2) * 0.25;
+  const bWind = gWind * WIND_STRENGTH;
+  const scale = baseLength * 6.8;
+  const dx = bWind * scale * cos(k + wPhase * 1.1);
+  const dy = bWind * scale * 0.52 * sin(k * 1.7 + wPhase * 0.85);
+  return { x: f.px + dx, y: f.py + dy };
+}
+
 // ── Fruits ────────────────────────────────────────────────
 
 function countLivingFruits() {
   let c = 0;
   for (const f of fruits) {
-    if (f.mode !== 'gone') c++;
+    if (f.mode !== 'gone' && f.mode !== 'fadeQuiet') c++;
   }
   return c;
 }
@@ -539,15 +580,30 @@ function desiredCanopyFruitCount(nTips) {
   return min(FRUIT_MAX, max(fromPairs, fromDensity));
 }
 
-/** Deterministic spread: cycles through twig pairs, walks within a pair so both twigs can get berries over time. */
+function tipOccupiedByOnTreeFruit(ti) {
+  for (const f of fruits) {
+    if (f.mode === 'onTree' && f.tipIndex === ti) return true;
+  }
+  return false;
+}
+
+/**
+ * Pick a twig tip for the next canopy berry: golden-ratio sequence in slot breaks DFS clumps,
+ * then linear open-addressing so we prefer one fruit per tip until the tree is full.
+ */
 function tipIndexForFruitSlot(slot, nTips) {
-  const pairs = max(1, ceil(nTips / FRUIT_TWIG_PAIR));
-  const pi = slot % pairs;
-  const t0 = min(pi * FRUIT_TWIG_PAIR, nTips - 1);
-  const span = min(FRUIT_TWIG_PAIR, nTips - t0);
-  const cycle = floor(slot / pairs);
-  const o = span <= 1 ? 0 : cycle % span;
-  return t0 + o;
+  if (nTips <= 0) return 0;
+  const phi = 0.6180339887498949;
+  const offset = fract((treeSeed >>> 0) * 0.000045678 + 0.271828);
+  const g = fract((slot + 0.5) * phi + offset);
+  let base = min(nTips - 1, floor(g * nTips));
+  if (!tipOccupiedByOnTreeFruit(base)) return base;
+  const step = 1 + ((((slot + 1) * 1103515245) ^ (treeSeed >>> 0)) >>> 0) % max(1, nTips - 1);
+  for (let i = 1; i <= nTips; i++) {
+    const ti = (base + i * step) % nTips;
+    if (!tipOccupiedByOnTreeFruit(ti)) return ti;
+  }
+  return base;
 }
 
 function createFruitAtTip(tipIndex) {
@@ -586,6 +642,31 @@ function refillCanopyFruits() {
   }
 }
 
+/** Force one on-tree berry to fall; completes growth if needed. Returns true if a fruit fell. */
+function forceDropOneCanopyFruitIfAny() {
+  const candidates = [];
+  for (const f of fruits) {
+    if (f.mode === 'onTree' && (f.onTreeAlpha ?? 1) > 0.08) {
+      candidates.push(f);
+    }
+  }
+  if (candidates.length === 0) return false;
+  const pick = candidates[floor(random(candidates.length))];
+  if (pick.growthPhase) {
+    pick.growthPhase = false;
+    pick.size = pick.targetSize;
+  }
+  const tip = twigTips.length > 0 ? twigTips[pick.tipIndex % twigTips.length] : null;
+  if (!tip) return false;
+  pick.mode = 'falling';
+  pick.px = tip.x;
+  pick.py = tip.y;
+  pick.vx = random(-1.2, 1.2);
+  pick.vy = random(-0.5, 0.8);
+  pick.fallAlpha = 1;
+  return true;
+}
+
 function isTreeShrinking() {
   return state === 1 &&
     quietSinceMs !== null &&
@@ -594,10 +675,10 @@ function isTreeShrinking() {
 
 /** At most one new fall per frame while react is up — uses `fruitPluckBudget` from each clap. */
 function tryPluckOneFruitFromBudget() {
-  if (fruitPluckBudget <= 0 || reactIntensity <= 0.28) return;
+  if (fruitPluckBudget <= 0 || reactIntensity <= 0.12) return;
   const candidates = [];
   for (const f of fruits) {
-    if (f.mode === 'onTree' && !f.growthPhase && f.ripe >= 0.55 && (f.onTreeAlpha ?? 1) > 0.08) {
+    if (f.mode === 'onTree' && !f.growthPhase && f.ripe >= 0.45 && (f.onTreeAlpha ?? 1) > 0.08) {
       candidates.push(f);
     }
   }
@@ -646,9 +727,9 @@ function updateAndDisplayElements() {
     }
 
     if (f.mode === 'onTree') {
-      f.ripe = min(f.ripe + 0.0025, 1);
+      f.ripe = min(f.ripe + 0.0055, 1);
       if (shrinking) {
-        f.onTreeAlpha = max(0, f.onTreeAlpha - SHRINK_PER_FRAME);
+        f.onTreeAlpha = max(0, f.onTreeAlpha - FRUIT_QUIET_FADE_PER_FRAME);
         if (f.onTreeAlpha <= 0) {
           f.mode = 'gone';
           continue;
@@ -662,7 +743,7 @@ function updateAndDisplayElements() {
       if (
         tip &&
         !f.growthPhase &&
-        f.ripe >= 0.55 &&
+        f.ripe >= 0.45 &&
         react > 0.5 &&
         random() < 0.0012
       ) {
@@ -693,24 +774,52 @@ function updateAndDisplayElements() {
         ellipse(0, 0, f.size);
         pop();
       } else if (f.lastTipX != null) {
-        f.mode = 'falling';
-        f.px = f.lastTipX;
-        f.py = f.lastTipY;
-        f.vx = random(-0.9, 0.9);
-        f.vy = random(-0.3, 0.5);
-        f.fallAlpha = 1;
+        if (shrinking) {
+          f.mode = 'fadeQuiet';
+          f.px = f.lastTipX;
+          f.py = f.lastTipY;
+          f.vx = 0;
+          f.vy = 0;
+          f.fallAlpha = f.onTreeAlpha ?? 1;
+        } else {
+          f.mode = 'falling';
+          f.px = f.lastTipX;
+          f.py = f.lastTipY;
+          f.vx = random(-0.9, 0.9);
+          f.vy = random(-0.3, 0.5);
+          f.fallAlpha = 1;
+        }
       }
+    } else if (f.mode === 'fadeQuiet') {
+      f.fallAlpha = max(0, f.fallAlpha - FRUIT_QUIET_FADE_PER_FRAME);
+      if (f.fallAlpha <= 0) {
+        f.mode = 'gone';
+        continue;
+      }
+      const pos = fruitSwayDrawPosition(f, true);
+      push();
+      fill(f.hue, f.sat, f.bri, 0.9 * f.fallAlpha);
+      ellipse(pos.x, pos.y, f.size);
+      pop();
     } else if (f.mode === 'falling') {
-      f.vy += 0.42;
-      f.px += f.vx;
-      f.py += f.vy;
       if (shrinking) {
-        f.fallAlpha = max(0, f.fallAlpha - SHRINK_PER_FRAME * 0.85);
+        f.vx = 0;
+        f.vy = 0;
+        f.fallAlpha = max(0, f.fallAlpha - FRUIT_QUIET_FADE_PER_FRAME);
         if (f.fallAlpha <= 0) {
           f.mode = 'gone';
           continue;
         }
+        const pos = fruitSwayDrawPosition(f, false);
+        push();
+        fill(f.hue, f.sat, f.bri, 0.9 * f.fallAlpha);
+        ellipse(pos.x, pos.y, f.size);
+        pop();
+        continue;
       }
+      f.vy += 0.42;
+      f.px += f.vx;
+      f.py += f.vy;
       if (f.py >= groundY - f.size * 0.35) {
         f.py = groundY - f.size * 0.35;
         f.vy = 0;
@@ -723,10 +832,19 @@ function updateAndDisplayElements() {
       pop();
     } else if (f.mode === 'ground') {
       if (shrinking) {
-        f.fallAlpha -= SHRINK_PER_FRAME;
-      } else {
-        f.fallAlpha -= 0.007;
+        f.fallAlpha = max(0, f.fallAlpha - FRUIT_QUIET_FADE_PER_FRAME);
+        if (f.fallAlpha <= 0) {
+          f.mode = 'gone';
+          continue;
+        }
+        const pos = fruitSwayDrawPosition(f, false);
+        push();
+        fill(f.hue, f.sat, f.bri, 0.88 * f.fallAlpha);
+        ellipse(pos.x, pos.y, f.size);
+        pop();
+        continue;
       }
+      f.fallAlpha -= 0.007;
       if (f.fallAlpha <= 0) {
         f.mode = 'gone';
       } else {
@@ -757,6 +875,17 @@ function tryAdvanceFromSound() {
     reactIntensity = 1.0;
     const add = floor(random(2, 6));
     fruitPluckBudget = min(FRUIT_PLUCK_BUDGET_CAP, fruitPluckBudget + add);
+
+    if (treeGrowth >= FRUIT_THRESHOLD && countLivingFruits() > 0) {
+      fruitDropSoundPulseCounter++;
+      if (fruitDropSoundPulseCounter >= FRUIT_DROP_FORCE_EVERY_N_SOUNDS) {
+        if (forceDropOneCanopyFruitIfAny()) {
+          fruitDropSoundPulseCounter = 0;
+        } else {
+          fruitDropSoundPulseCounter = FRUIT_DROP_FORCE_EVERY_N_SOUNDS - 1;
+        }
+      }
+    }
   }
 
   lastSoundTime = millis();
@@ -786,6 +915,10 @@ function draw() {
   updateAdaptiveSoundThreshold();
 
   reactIntensity = max(reactIntensity - REACT_DECAY, 0);
+
+  if (state !== 1 || treeGrowth < FRUIT_THRESHOLD) {
+    fruitDropSoundPulseCounter = 0;
+  }
 
   if (soundLevel > soundThreshold) {
     quietSinceMs = null;
